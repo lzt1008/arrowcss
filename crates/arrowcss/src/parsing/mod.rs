@@ -1,3 +1,4 @@
+pub mod candidate;
 pub mod utility;
 pub mod variant;
 
