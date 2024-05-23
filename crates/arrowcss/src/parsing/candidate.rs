@@ -1,28 +1,31 @@
-#![allow(unused)]
-use std::ops::{ControlFlow, Deref, DerefMut, Index};
+use std::ops::Index;
 
 use arrowcss_extractor::cursor::Cursor;
-use either::Either;
+use derive_more::{Deref, DerefMut};
+use either::Either::{self, Left, Right};
 use smallvec::{smallvec, SmallVec};
 use tracing::debug;
-use tracing_subscriber::util;
 
-use super::{UtilityCandidate, VariantCandidate};
+use super::{
+    state::{State, StateTransformer, UtilityTransformer},
+    UtilityCandidate, VariantCandidate,
+};
 use crate::{
     common::MaybeArbitrary,
     context::{
         utilities::{UtilityStorage, UtilityStorageImpl},
-        Context,
+        VariantStorage,
     },
+    parsing::state::VariantTransformer,
+    process::{Variant, VariantKind},
 };
 
+#[derive(Deref, DerefMut)]
 pub struct CandidateParser<'a> {
     input: &'a str,
+    #[deref]
+    #[deref_mut]
     cursor: Cursor<'a>,
-    state: State,
-    ctx: &'a Context,
-    utility: UtilityCandidate<'a>,
-    variants: SmallVec<[VariantCandidate<'a>; 1]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +34,6 @@ pub struct Span {
     end: usize,
 }
 
-// str` to implement `std::ops::Index<candidate::Span>
 impl Index<Span> for str {
     type Output = str;
 
@@ -76,119 +78,41 @@ pub enum Token<'a> {
     Bang,
     /// `-`
     Minus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    /// Initial state
-    ///
-    /// Accepts: Ident, Arbitrary
-    Initial,
-    /// At least one Ident has been parsed
-    ///
-    /// Accepts: Ident, Arbitrary, Colon, Slash
-    AfterIdent,
-    /// After Arbitrary
-    ///
-    /// Accepts: Colon, Slash
-    AfterArbitrary,
-    /// After Slash
-    ///
-    /// Accepts: Ident, Arbitrary
-    AfterSlash,
-    /// Done
-    Eof,
-}
-
-impl State {
-    pub fn transform(&mut self, token: Token) -> Result<(), ()> {
-        let res = match (&self, token) {
-            (State::Initial, Token::Bang) => Ok(State::Initial),
-            (State::Initial, Token::Minus) => Ok(State::Initial),
-            (State::Initial, Token::Ident(_)) => Ok(State::AfterIdent),
-            (State::Initial, Token::Arbitrary(_)) => Ok(State::AfterArbitrary),
-            (State::AfterIdent, Token::Ident(_)) => Ok(State::AfterIdent),
-            (State::AfterIdent, Token::Arbitrary(_)) => Ok(State::AfterArbitrary),
-            (State::AfterIdent, Token::Slash) => Ok(State::AfterSlash),
-            (State::AfterArbitrary, Token::Slash) => Ok(State::AfterSlash),
-            (State::AfterSlash, Token::Ident(_)) => Ok(State::Eof),
-            (State::AfterSlash, Token::Arbitrary(_)) => Ok(State::Eof),
-            _ => Err(()),
-        };
-        debug!("transform: {:?} to {:?}, token: {:?}", self, res, token);
-        *self = res?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Repr<'a> {
-    value: &'a str,
-    idents: SmallVec<[Span; 2]>,
-    arbitrary: Option<&'a str>,
-    modifier: Option<Either<Span, &'a str>>,
-}
-
-impl<'a> Repr<'a> {
-    pub fn new() -> Self {
-        Self {
-            value: "",
-            idents: SmallVec::new(),
-            arbitrary: None,
-            modifier: None,
-        }
-    }
-}
-
-impl<'a> Deref for CandidateParser<'a> {
-    type Target = Cursor<'a>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.cursor
-    }
-}
-
-impl<'a> DerefMut for CandidateParser<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.cursor
-    }
+    /// `@`
+    At,
 }
 
 impl<'a> CandidateParser<'a> {
-    pub fn new(ctx: &'a Context, input: &'a str) -> Self {
+    pub fn new(input: &'a str) -> Self {
         Self {
             input,
-            ctx,
-            state: State::Initial,
             cursor: Cursor::new(input),
-            utility: UtilityCandidate::default(),
-            variants: SmallVec::new(),
         }
     }
 
-    pub fn str_from(&self, start: usize) -> &'a str {
+    fn str_from(&self, start: usize) -> &'a str {
         &self.input[start..self.cursor.pos()]
     }
 
-    pub fn span_from(&self, start: usize) -> Span {
+    fn span_from(&self, start: usize) -> Span {
         Span {
             start,
             end: self.cursor.pos(),
         }
     }
 
-    fn consume<R>(&mut self, f: impl FnOnce(&mut Cursor<'a>) -> R) -> &'a str {
-        let start = self.cursor.pos();
-        f(&mut self.cursor);
-        self.str_from(start)
-    }
-
-    pub fn next_token(&mut self) -> Result<Option<Token<'a>>, ()> {
-        let start = self.cursor.pos();
-        let res = self
-            .consume(|c| c.eat_until(|c| c == '-' || c == '[' || c == ']' || c == '/' || c == '!'));
+    fn next_token(&mut self) -> Result<Option<Token<'a>>, ()> {
+        let start = self.pos();
 
         let res = match self.first() {
+            'a'..='z' | '0'..='9' => {
+                self.eat_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+                let res = Some(Token::Ident(self.span_from(start)));
+                if self.first() == '-' {
+                    self.bump();
+                }
+                res
+            }
             '[' => {
                 self.bump();
                 let start = self.cursor.pos();
@@ -196,55 +120,71 @@ impl<'a> CandidateParser<'a> {
                 let tok = self.str_from(start);
                 Some(Token::Arbitrary(tok))
             }
-            '-' => Some(Token::Ident(self.span_from(start))),
+            '-' => Some(Token::Minus),
             '!' => Some(Token::Bang),
             '/' => Some(Token::Slash),
-            '\0' if !res.is_empty() => Some(Token::Ident(self.span_from(start))),
+            '@' => Some(Token::At),
             '\0' => None,
-            _ => unreachable!(),
+            _ => return Err(()),
         };
 
-        if let Some(tok) = res {
-            self.state.transform(tok)?;
+        if !matches!(res, Some(Token::Ident(_))) {
             self.bump();
         }
 
         Ok(res)
     }
+}
 
-    pub fn parse_ast(&mut self) -> Option<Repr<'a>> {
-        let mut accept_modifier = false;
-        let mut repr = Repr::new();
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UtilityRepr<'a> {
+    idents: SmallVec<[Span; 2]>,
+    arbitrary: Option<&'a str>,
+    modifier: Option<Either<Span, &'a str>>,
+    important: bool,
+    negative: bool,
+}
+
+impl<'a> CandidateParser<'a> {
+    fn parse_utility_repr(&mut self) -> Option<UtilityRepr<'a>> {
+        let mut repr = UtilityRepr::default();
+        let mut state = State::Initial;
 
         while let Some(token) = self.next_token().ok()? {
-            debug!("token: {:?}, state: {:?}", token, self.state);
-            match token {
-                Token::Bang => {
-                    // repr.negative = true;
+            debug!("token: {:?}, state: {:?}", token, state);
+            let new_state = UtilityTransformer::transform(&state, token).ok()?;
+            match (token, state) {
+                (Token::Bang, State::Initial) if !repr.important => {
+                    repr.important = true;
                 }
-                Token::Ident(span) => {
-                    if self.state == State::Eof {
-                        repr.modifier = Some(Either::Left(span));
-                        accept_modifier = false;
-                    } else {
-                        repr.idents.push(span);
-                    }
+                (Token::Bang, _) if !repr.important && new_state == State::Eof => {
+                    repr.important = true;
                 }
-                Token::Arbitrary(arb) => {
-                    if self.state == State::Eof {
-                        repr.modifier = Some(Either::Right(arb));
-                    } else {
-                        repr.arbitrary = Some(arb);
-                    }
+                (Token::Minus, State::Initial) if !repr.negative => {
+                    repr.negative = true;
                 }
-                _ => {}
+                (Token::Ident(span), State::Initial | State::AfterIdent) => {
+                    repr.idents.push(span);
+                }
+                (Token::Arbitrary(arb), State::Initial | State::AfterIdent) => {
+                    repr.arbitrary = Some(arb);
+                }
+                (Token::Ident(span), State::AfterSlash) if repr.modifier.is_none() => {
+                    repr.modifier = Some(Either::Left(span));
+                }
+                (Token::Arbitrary(arb), State::AfterSlash) if repr.modifier.is_none() => {
+                    repr.modifier = Some(Either::Right(arb));
+                }
+                (Token::Slash, State::AfterArbitrary | State::AfterIdent) => {}
+                _ => return None,
             }
+            state = new_state;
         }
         Some(repr)
     }
 
     pub fn parse_utility(&mut self, ut: &UtilityStorageImpl) -> Option<UtilityCandidate<'a>> {
-        let repr = self.parse_ast()?;
+        let repr = self.parse_utility_repr()?;
 
         if let Some(arb) = repr.arbitrary {
             if repr.idents.is_empty() {
@@ -254,14 +194,14 @@ impl<'a> CandidateParser<'a> {
                     value: Some(MaybeArbitrary::Arbitrary(value)),
                     modifier: None,
                     arbitrary: true,
-                    important: false,
-                    negative: false,
+                    important: repr.important,
+                    negative: repr.negative,
                 });
             }
 
             let key = repr.idents[0].to(repr.idents.last().unwrap());
 
-            debug!("key: {:?}", &self.input[key]);
+            ut.get(&self.input[key])?;
             return Some(UtilityCandidate {
                 key: &self.input[key],
                 value: Some(MaybeArbitrary::Arbitrary(arb)),
@@ -271,34 +211,305 @@ impl<'a> CandidateParser<'a> {
                     None => None,
                 },
                 arbitrary: false,
-                important: false,
-                negative: false,
+                important: repr.important,
+                negative: repr.negative,
             });
+        }
+
+        debug!("{:?}", repr);
+
+        let mut iter = repr.idents.iter().rev().peekable();
+        let mut prev = iter.next();
+
+        for ident in iter {
+            let key = &self.input[repr.idents[0].to(ident)];
+            if ut.get(key).is_some() {
+                return Some(UtilityCandidate {
+                    key,
+                    value: Some(MaybeArbitrary::Named(
+                        &self.input[prev.unwrap().to(repr.idents.last().unwrap())],
+                    )),
+                    modifier: match repr.modifier {
+                        Some(Either::Left(span)) => Some(MaybeArbitrary::Named(&self.input[span])),
+                        Some(Either::Right(arb)) => Some(MaybeArbitrary::Arbitrary(arb)),
+                        None => None,
+                    },
+                    arbitrary: false,
+                    important: repr.important,
+                    negative: repr.negative,
+                });
+            }
+
+            prev = Some(ident);
         }
         None
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VariantRepr<'a> {
+    idents: SmallVec<[Span; 2]>,
+    arbitrary: Option<&'a str>,
+    modifier: Option<MaybeArbitrary<'a>>,
+}
+
+impl<'a> CandidateParser<'a> {
+    fn parse_variant_repr(&mut self) -> Option<VariantRepr<'a>> {
+        let mut repr = VariantRepr::default();
+        let mut modifier: Option<Either<Span, &str>> = None;
+        let mut state = State::Initial;
+
+        while let Some(token) = self.next_token().ok()? {
+            debug!("token: {:?}, state: {:?}", token, state);
+            let new_state = VariantTransformer::transform(&state, token).ok()?;
+
+            match (token, state) {
+                (Token::At, State::Initial) => {
+                    repr.idents.push(Span::new(0, 1));
+                }
+                (Token::Ident(span), State::Initial | State::AfterIdent) => {
+                    repr.idents.push(span);
+                }
+                (Token::Arbitrary(arb), State::Initial | State::AfterIdent) => {
+                    repr.arbitrary = Some(arb);
+                }
+                (Token::Ident(span), State::AfterSlash) if modifier.is_none() => {
+                    modifier = Some(Either::Left(span));
+                }
+                (Token::Ident(span), State::AfterSlashIdent)
+                    if modifier.is_some_and(|m| m.is_left()) =>
+                {
+                    let Some(Left(s)) = modifier else { return None };
+                    modifier = Some(Left(s.to(&span)))
+                }
+                (Token::Arbitrary(arb), State::AfterSlash) if repr.modifier.is_none() => {
+                    modifier = Some(Either::Right(arb));
+                }
+                (Token::Slash, State::AfterArbitrary | State::AfterIdent) => {}
+                _ => return None,
+            }
+            state = new_state;
+        }
+        repr.modifier = modifier.map(|m| match m {
+            Left(span) => MaybeArbitrary::Named(&self.input[span]),
+            Right(arb) => MaybeArbitrary::Arbitrary(arb),
+        });
+        Some(repr)
+    }
+
+    pub fn parse_variant(&mut self, v: &VariantStorage) -> Option<VariantCandidate<'a>> {
+        // try static match
+        if let Some(variant) = v.get(self.input) {
+            return (variant.kind == VariantKind::Static)
+                .then(|| VariantCandidate::new(variant.clone(), self.input).into());
+        }
+
+        let repr = self.parse_variant_repr()?;
+
+        // full arbitrary
+        if let (Some(arb), true) = (repr.arbitrary, repr.idents.is_empty()) {
+            return Some(VariantCandidate::new(Variant::new_static([arb]), arb).arbitrary());
+        }
+
+        let mut layers = smallvec![];
+        let slice = &mut repr.idents.as_slice();
+        while let Some((key, variant)) = find_key(&self.input, v, slice) {
+            match variant.kind {
+                VariantKind::Composable => {
+                    layers.push(variant.take_composable()?.clone());
+                }
+                VariantKind::Dynamic => {
+                    return VariantCandidate::new(variant, key)
+                        .with_value(
+                            (!slice.is_empty())
+                                .then(|| MaybeArbitrary::Named(substr(self.input, slice)))
+                                .or_else(|| repr.arbitrary.map(MaybeArbitrary::Arbitrary)),
+                        )
+                        .with_modifier(repr.modifier)
+                        .with_layers(layers)
+                        .into();
+                }
+                VariantKind::Static => {
+                    // must exhausted
+                    if !slice.is_empty() {
+                        return None;
+                    }
+                    return VariantCandidate::new(variant, key)
+                        .with_layers(layers)
+                        .with_modifier(repr.modifier)
+                        .into();
+                }
+            }
+        }
+
+        None
+    }
+}
+
+fn substr<'a>(input: &'a str, span: &[Span]) -> &'a str {
+    &input[span.first().unwrap().to(span.last().unwrap())]
+}
+
+fn find_key<'a>(
+    input: &'a str,
+    v: &VariantStorage,
+    spans: &mut &[Span],
+) -> Option<(&'a str, Variant)> {
+    let first = spans.first()?;
+
+    for (idx, i) in spans.iter().enumerate().rev() {
+        let key = &input[first.to(i)];
+        if let Some(variant) = v.get(key) {
+            *spans = &mut &spans[(idx + 1)..];
+            return Some((key, variant.clone()));
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use tracing::Level;
 
-    use super::*;
-    use crate::preset::preset_tailwind;
+    macro_rules! maybe_arb {
+        (named $named:literal) => {
+            Some($crate::common::MaybeArbitrary::Named($named))
+        };
+        (arb $arb:literal) => {
+            Some($crate::common::MaybeArbitrary::Arbitrary($arb))
+        };
+        (None) => {
+            None
+        };
+        () => {
+            None
+        };
+    }
 
-    #[test]
-    fn test_parse() {
-        tracing_subscriber::fmt()
-            .without_time()
-            .with_max_level(Level::DEBUG)
-            .init();
+    macro_rules! get_neg {
+        ($bool:literal) => {
+            true
+        };
+        () => {
+            false
+        };
+    }
 
-        let input = r#"[color:red]"#;
-        let mut ctx = Context::default();
-        preset_tailwind(&mut ctx);
-        let mut parser = CandidateParser::new(&ctx, input);
+    macro_rules! candidate {
+        ( $key:literal: $value_ty:ident $value:literal $( / $mod_ty:ident $mod:literal )? $(, neg: $neg:literal)? $(, imp: $imp:literal)? ) => {
 
-        let ast = parser.parse_utility(&ctx.utilities);
-        println!("{:#?}", ast);
+            crate::parsing::UtilityCandidate {
+                key: $key,
+                value: maybe_arb!($value_ty $value),
+                modifier: maybe_arb!($($mod_ty $mod)?),
+                arbitrary: false,
+                important: get_neg!($($imp)?),
+                negative: get_neg!($($neg)?),
+            }
+        };
+        ( [ $key:literal: $value:literal ] $(, neg: $neg:literal)? $(, imp: $imp:literal)? ) => {
+            crate::parsing::UtilityCandidate {
+                key: $key,
+                value: maybe_arb!(arb $value),
+                modifier: None,
+                arbitrary: true,
+                important: get_neg!($($imp)?),
+                negative: get_neg!($($neg)?),
+            }
+        };
+    }
+
+    macro_rules! test_group {
+        (utility => $($fn_name:ident $input:expr => $expected:expr),* $(,)?) => {
+            $(
+                paste::item! {
+                    #[test]
+                    fn [< test_utility_ $fn_name >] () {
+                        assert_eq!(run($input), Some($expected));
+                    }
+                }
+            )*
+        };
+        (variant => $($fn_name:ident $input:expr => $expected:expr),* $(,)?) => {
+            $(
+                paste::item! {
+                    #[test]
+                    fn [< test_variant_ $fn_name >] () {
+                        assert_eq!(run_variant($input), Some($expected.into()));
+                    }
+                }
+            )*
+        };
+    }
+
+    mod utility {
+        use crate::{
+            parsing::{candidate::CandidateParser, UtilityCandidate},
+            preset::preset_tailwind,
+            Context,
+        };
+
+        fn run(input: &str) -> Option<UtilityCandidate> {
+            let mut ctx = Context::default();
+            preset_tailwind(&mut ctx);
+            let mut parser = CandidateParser::new(input);
+
+            parser.parse_utility(&ctx.utilities)
+        }
+
+        test_group! { utility =>
+            basic           "text-blue-500"     => candidate!("text": named "blue-500"),
+            basic_important "text-blue-500!"    => candidate!("text": named "blue-500", imp: true),
+            basic_w         "w-10"              => candidate!("w": named "10"),
+            neg_w           "-w-10"             => candidate!("w": named "10", neg: true),
+            imp_w           "!w-10"             => candidate!("w": named "10", imp: true),
+            neg_imp_w       "-!w-10"            => candidate!("w": named "10", neg: true, imp: true),
+            neg_imp_w2      "!-w-10"            => candidate!("w": named "10", neg: true, imp: true),
+            neg_imp_w3      "-w-10!"            => candidate!("w": named "10", neg: true, imp: true),
+            arb_w           "w-[10px]"          => candidate!("w": arb "10px"),
+            arb_mod_w       "text-[10px]/100"   => candidate!("text": arb "10px" / named "100"),
+            arb_arbmod_w    "text-[10px]/[100]" => candidate!("text": arb "10px" / arb "100"),
+        }
+    }
+
+    mod variant {
+        use arrowcss_css_macro::rule_list;
+        use smol_str::SmolStr;
+
+        use crate::{parsing::candidate::CandidateParser, preset::preset_tailwind, Context};
+
+        fn run_variant(input: &str) -> Option<SmolStr> {
+            let mut ctx = Context::default();
+            preset_tailwind(&mut ctx);
+
+            let mut parser = CandidateParser::new(input);
+
+            parser
+                .parse_variant(&ctx.variants)?
+                .handle(rule_list!("&" {}))
+                .as_single()?
+                .selector
+                .into()
+        }
+
+        test_group! { variant =>
+            basic "hover" => "&:hover",
+            functional "aria-hidden" => r#"&[aria-hidden="true"]"#,
+            composable "group-hover" => "&:is(:where(.group):hover *)",
+            arb "[:hover]" => "&:is(:hover)",
+            arb2 "[&:hover]" => "&:hover",
+            arb_at "[@supports(display:grid)]" => "@supports(display:grid)",
+            // TODO: [@media(any-hover:hover){&:hover}]
+            modifier "group-hover/name" => r#"&:is(:where(.group\/name):hover *)"#,
+            modifier2 "group-hover/the-name" => r#"&:is(:where(.group\/the-name):hover *)"#,
+            modifier3 "group-hover/[the-name]" => r#"&:is(:where(.group\/the-name):hover *)"#,
+            basic_composable "has-hover" => r#"&:has(*:hover)"#,
+            composable_funtional "has-aria-hidden" => "&:has(*[aria-hidden=\"true\"])",
+            composable_funtional_arb "has-aria-[sort=ascending]" => "&:has(*[aria-sort=ascending])",
+            composable_funtional_arb_modifier "has-group-hover/the-name" => "&:has(*:is(:where(.group\\/the-name):hover *))",
+            composable_funtional_arb_modifier_arb "has-group-hover/[the-name]" => "&:has(*:is(:where(.group\\/the-name):hover *))",
+            multi_composable "has-not-group-hover" => "&:has(*:not(*:is(:where(.group):hover *)))",
+            multi_composable2 "has-not-group-hover/the-name" => r#"&:has(*:not(*:is(:where(.group\/the-name):hover *)))"#,
+        }
     }
 }

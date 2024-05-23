@@ -76,7 +76,7 @@ pub trait BasicParser {
 /// Either an arbitrary value or a named value
 ///
 /// This is used to store e.g. `[#123456]` or `blur-500` in like `text-*`
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MaybeArbitrary<'a> {
     Arbitrary(&'a str),
     Named(&'a str),

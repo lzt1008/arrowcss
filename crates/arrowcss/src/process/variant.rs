@@ -1,5 +1,5 @@
 use smallvec::{smallvec, SmallVec};
-use smol_str::SmolStr;
+use smol_str::{format_smolstr, SmolStr};
 
 use crate::{
     common::StrReplaceExt,
@@ -19,7 +19,6 @@ pub trait VariantHandlerExt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VariantKind {
-    Arbitrary,
     Static,
     Dynamic,
     Composable,
@@ -137,6 +136,10 @@ impl Variant {
             _ => None,
         }
     }
+
+    pub fn is_composable(&self) -> bool {
+        self.composable
+    }
 }
 
 impl VariantHandlerExt for Variant {
@@ -164,17 +167,17 @@ impl StaticHandler {
         let mut iter = matcher.into_iter();
         let is_duplicate = iter.len() > 1;
         if !is_duplicate {
-            let matcher = iter.next().unwrap().into();
-            match matcher.chars().next() {
+            let next = iter.next().unwrap().into();
+            match next.chars().next() {
                 Some('&') => {
-                    if matcher.starts_with("&::") {
-                        Self::PseudoElement(matcher)
+                    if next.starts_with("&::") {
+                        Self::PseudoElement(next)
                     } else {
-                        Self::Selector(matcher)
+                        Self::Selector(next)
                     }
                 }
-                Some('@') => Self::Nested(matcher),
-                _ => panic!("Invalid matcher: {}", matcher),
+                Some('@') => Self::Nested(next),
+                _ => Self::Selector(format_smolstr!("&:is({})", next)),
             }
         } else {
             Self::new_duplicate(iter)
@@ -185,7 +188,7 @@ impl StaticHandler {
         Self::Duplicate(matcher.into_iter().map(Into::into).collect())
     }
 
-    fn is_nested(&self) -> bool {
+    pub fn is_nested(&self) -> bool {
         matches!(self, Self::Nested(_))
     }
 }
@@ -236,7 +239,7 @@ impl DynamicHandler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComposableHandler {
     pub handler: fn(RuleList, &VariantCandidate) -> RuleList,
     pub composable: bool,
@@ -274,7 +277,7 @@ mod tests {
     use crate::{
         context::Context,
         css::{rule::RuleList, Decl, Rule},
-        parsing::VariantParser,
+        parsing::candidate::CandidateParser,
     };
 
     #[test]
@@ -284,8 +287,12 @@ mod tests {
         ctx.add_variant("active", ["&:active"]);
 
         let candidates = vec![
-            VariantParser::new("hover").parse(&ctx.variants).unwrap(),
-            VariantParser::new("active").parse(&ctx.variants).unwrap(),
+            CandidateParser::new("hover")
+                .parse_variant(&ctx.variants)
+                .unwrap(),
+            CandidateParser::new("active")
+                .parse_variant(&ctx.variants)
+                .unwrap(),
         ];
 
         let _input = css! {
@@ -320,7 +327,9 @@ mod tests {
         ctx.add_variant("hover", ["&:hover"]);
         ctx.add_variant("active", ["&:active"]);
 
-        let candidate = VariantParser::new("hover").parse(&ctx.variants).unwrap();
+        let candidate = CandidateParser::new("hover")
+            .parse_variant(&ctx.variants)
+            .unwrap();
         let input = css! {
             ".flex" {
                 "display": "flex";

@@ -13,7 +13,9 @@ use crate::{
     common::{StrReplaceExt, StrSplitExt},
     css::rule::RuleList,
     ordering::OrderingKey,
-    parsing::{UtilityCandidate, UtilityParser, VariantCandidate, VariantParser},
+    parsing::{
+        candidate::CandidateParser, UtilityCandidate, VariantCandidate,
+    },
     process::{Utility, UtilityApplyResult, UtilityGroup, Variant},
     theme::{Theme, ThemeValue},
 };
@@ -173,11 +175,11 @@ impl Context {
             });
         }
 
-        let utility_candidate = UtilityParser::new(utility).parse(&self.utilities)?;
+        let utility_candidate = CandidateParser::new(utility).parse_utility(&self.utilities)?;
 
         let vs = parts
             .into_iter()
-            .map(|v| VariantParser::new(v).parse(&self.variants))
+            .map(|v| CandidateParser::new(v).parse_variant(&self.variants))
             .collect::<Option<SmallVec<[_; 2]>>>()?;
 
         let variants = vs

@@ -48,9 +48,11 @@ schemars = { git = "https://github.com/GREsau/schemars.git", rev = "3a0ed64cbe06
     "either",
     "smol_str02",
 ] }
+derive_more = "0.99.17"
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
+paste = "1.0.15"
 
 [lib]
 bench = false
